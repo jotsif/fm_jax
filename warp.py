@@ -1,7 +1,6 @@
 import jax.numpy as np
 from jax import grad, jit, vmap
-from functools import partial
-from jax import lax
+from jax import lax, random
 from jax.experimental import optimizers
 # import time
 import itertools
@@ -39,26 +38,28 @@ def calc_score(user_repr, item_repr, z):
 
 
 def get_negative_item(params, user_repr, score_pos,
-                      item_dataset, max_samples, z):
+                      item_dataset, max_samples, z, key):
     """Sample a negative item ranked higher than the positive item"""
     n_items = item_dataset.shape[0]
 
     def resample(state):
-        _, _, sampled = state
+        _, _, sampled, key = state
         sampled = sampled + 1
-        neg_item = npr.randint(0, n_items)
+        key, key_ = random.split(key)
+        neg_item = random.randint(key_, (1, ), 0, n_items)
         # TODO: should not sample positive item
         neg_repr = compute_representation(item_dataset[neg_item],
                                           params[ITEM_FEATURE_EMBEDDING_IDX],
                                           params[ITEM_BIAS_IDX])
-        return (neg_item, calc_score(user_repr, neg_repr, z), sampled)
+        return (neg_item, calc_score(user_repr, neg_repr, z), sampled, key)
 
     def cond(state):
-        (_, score_neg, sampled) = state
+        _, score_neg, sampled, _ = state
         return (score_neg < score_pos - 1) & (sampled < max_samples)
 
-    (neg_item, _, sampled) = lax.while_loop(cond, resample,
-                                            (0, score_pos - 2, 0))
+    (neg_item, _, sampled, _) = lax.while_loop(cond, resample,
+                                               (np.array([0]), score_pos - 2,
+                                                0, key))
     return neg_item, sampled
 
 
@@ -68,7 +69,8 @@ def warp(params,
          max_samples,
          item_dataset,
          user_data,
-         item_data):
+         item_data,
+         key):
     """
     Calculate rank constant and score error for a given (u, i)-pair
     """
@@ -87,8 +89,10 @@ def warp(params,
                                           lax.stop_gradient(score_pos),
                                           item_dataset,
                                           max_samples,
-                                          z)
-
+                                          z,
+                                          key)
+#    neg_item = 0
+#    sampled = 1
     # Recalculate negative representation since
     # while_loop is not differentiable yet in jax
 
@@ -128,11 +132,13 @@ def initial_params(n_user_features, n_item_features, z):
 
 
 def loss(params, z, max_samples, item_dataset,
-         user_data, item_data):
+         user_data, item_data, key):
     """Convenience function for loss"""
-    res = vmap(warp, in_axes=(None, None, None, None, 0, 0))(
+    batch_size = user_data.shape[0]
+    keys = random.split(key, batch_size)
+    res = vmap(warp, in_axes=(None, None, None, None, 0, 0, 0))(
         params, z, max_samples, item_dataset,
-        user_data, item_data)
+        user_data, item_data, keys)
     return np.mean(res)
 
 
@@ -166,7 +172,7 @@ def prepare_data(interactions, user_feature_cols, item_feature_cols):
 
 def fit(user_data, item_data, item_dataset,
         num_epochs=1, step_size=0.1, batch_size=100, z=50,
-        max_samples=10):
+        max_samples=10, seed=0):
     n_users = user_data.max() + 1
     n_items = item_data.max() + 1
     user_data = np.array(user_data)
@@ -179,7 +185,7 @@ def fit(user_data, item_data, item_dataset,
     if user_data.shape[0] != item_data.shape[0]:
         raise ValueError("User and item data not of the same shape")
 
-    opt_init, opt_update, get_params = optimizers.sgd(step_size)
+    opt_init, opt_update, get_params = optimizers.adam(step_size)
 
     num_batches = int(item_data.shape[0]/batch_size)
     batches = data_stream(user_data, item_data,
@@ -188,12 +194,15 @@ def fit(user_data, item_data, item_dataset,
     opt_state = opt_init(initial_params(n_users,
                                         n_items,
                                         z))
+    key = random.PRNGKey(seed)
 
-    def update(i, opt_state, batch):
+    @jit
+    def update(i, opt_state, batch, key):
         params = get_params(opt_state)
         user_data, item_data = batch
-        grad_loss = grad(loss)(params, z, max_samples, item_dataset,
-                               user_data, item_data)
+        grad_loss = grad(loss)(params, z, max_samples,
+                               item_dataset, user_data,
+                               item_data, key)
         return opt_update(i,
                           grad_loss,
                           opt_state)
@@ -201,6 +210,8 @@ def fit(user_data, item_data, item_dataset,
     for epoch in range(num_epochs):
         print(f"Epoch {epoch}")
         for _ in tqdm(range(num_batches)):
-            opt_state = update(next(itercount), opt_state, next(batches))
+            key, key_ = random.split(key)
+            opt_state = update(next(itercount), opt_state,
+                               next(batches), key_)
     params = get_params(opt_state)
     return params

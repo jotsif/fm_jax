@@ -15,4 +15,4 @@ item_data, user_data, item_dataset, item_map, user_map = \
 res = fit(user_data,
           item_data,
           item_dataset,
-          batch_size=100)
+          batch_size=100000)
