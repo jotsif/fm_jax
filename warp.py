@@ -1,5 +1,6 @@
 import jax.numpy as np
 from jax import grad, jit, vmap
+from functools import partial
 from jax import lax
 from jax.experimental import optimizers
 # import time
@@ -18,7 +19,6 @@ def make_embedding_map(matrix):
     return _map
 
 
-@jit
 def compute_representation(feature_values, feature_embeddings, feature_bias):
     """
     Compute vector representation of current row id using the feature values,
@@ -26,15 +26,20 @@ def compute_representation(feature_values, feature_embeddings, feature_bias):
     feature_values is a key value dict
     """
     def get_embedding(key):
-        return feature_embeddings[key]
+        feature_vector = feature_embeddings[key]
+        return np.append(feature_vector, feature_bias[key])
 
     embs = vmap(get_embedding)(feature_values)
 
     return np.sum(embs, axis=0)
 
 
+def calc_score(user_repr, item_repr, z):
+    return np.dot(user_repr[:z], item_repr[:z]) + user_repr[z] + item_repr[z]
+
+
 def get_negative_item(params, user_repr, score_pos,
-                      item_dataset, max_samples):
+                      item_dataset, max_samples, z):
     """Sample a negative item ranked higher than the positive item"""
     n_items = item_dataset.shape[0]
 
@@ -42,25 +47,28 @@ def get_negative_item(params, user_repr, score_pos,
         _, _, sampled = state
         sampled = sampled + 1
         neg_item = npr.randint(0, n_items)
+        # TODO: should not sample positive item
         neg_repr = compute_representation(item_dataset[neg_item],
                                           params[ITEM_FEATURE_EMBEDDING_IDX],
                                           params[ITEM_BIAS_IDX])
-        return (neg_item, np.dot(user_repr, neg_repr), sampled)
+        return (neg_item, calc_score(user_repr, neg_repr, z), sampled)
 
     def cond(state):
         (_, score_neg, sampled) = state
         return (score_neg < score_pos - 1) & (sampled < max_samples)
 
     (neg_item, _, sampled) = lax.while_loop(cond, resample,
-                                            (0, score_pos + 1, 0))
+                                            (0, score_pos - 2, 0))
     return neg_item, sampled
 
 
+# @partial(jit, static_argnums=(1, 2, 3))
 def warp(params,
+         z,
+         max_samples,
          item_dataset,
          user_data,
-         item_data,
-         max_samples=10):
+         item_data):
     """
     Calculate rank constant and score error for a given (u, i)-pair
     """
@@ -71,13 +79,16 @@ def warp(params,
     pos_repr = compute_representation(item_data,
                                       params[ITEM_FEATURE_EMBEDDING_IDX],
                                       params[ITEM_BIAS_IDX])
-    # Bias?
-    score_pos = np.dot(user_repr, pos_repr)
+
+    score_pos = calc_score(user_repr, pos_repr, z)
+
     neg_item, sampled = get_negative_item(lax.stop_gradient(params),
                                           lax.stop_gradient(user_repr),
                                           lax.stop_gradient(score_pos),
                                           item_dataset,
-                                          max_samples)
+                                          max_samples,
+                                          z)
+
     # Recalculate negative representation since
     # while_loop is not differentiable yet in jax
 
@@ -92,6 +103,7 @@ def warp(params,
         loss = score_neg - score_pos + 1
         return constant * loss
 
+    # If we can't find a negative example skip this positive pair
     loss = np.where(sampled < max_samples, loss(), 0)
     return loss
 
@@ -105,21 +117,21 @@ ITEM_BIAS_IDX = 3
 
 def initial_params(n_user_features, n_item_features, z):
     """
-    TODO: change initialisation distribution?
+    Using same initisialisation as lightfm
     """
     return [
-        onp.random.randn(n_user_features, z),  # user feature embeddings
-        onp.random.randn(n_item_features, z),  # item feature embeddings
-        onp.random.randn(n_user_features, 1),  # user feature bias
-        onp.random.randn(n_item_features, 1),  # item feature bias
+        np.array(onp.random.rand(n_user_features, z) - 0.5)/z,  # user feature embeddings
+        np.array(onp.random.rand(n_item_features, z) - 0.5)/z,  # item feature embeddings
+        np.zeros(n_user_features),  # user feature bias
+        np.zeros(n_item_features),  # item feature bias
     ]
 
 
-def loss(params, item_dataset,
+def loss(params, z, max_samples, item_dataset,
          user_data, item_data):
     """Convenience function for loss"""
-    res = vmap(warp, in_axes=(None, None, 0, 0))(
-        params, item_dataset,
+    res = vmap(warp, in_axes=(None, None, None, None, 0, 0))(
+        params, z, max_samples, item_dataset,
         user_data, item_data)
     return np.mean(res)
 
@@ -153,7 +165,10 @@ def prepare_data(interactions, user_feature_cols, item_feature_cols):
 
 
 def fit(user_data, item_data, item_dataset,
-        num_epochs=1, step_size=0.001, batch_size=100, z=50):
+        num_epochs=1, step_size=0.1, batch_size=100, z=50,
+        max_samples=10):
+    n_users = user_data.max() + 1
+    n_items = item_data.max() + 1
     user_data = np.array(user_data)
     item_data = np.array(item_data)
     item_dataset = np.array(item_dataset)
@@ -164,28 +179,27 @@ def fit(user_data, item_data, item_dataset,
     if user_data.shape[0] != item_data.shape[0]:
         raise ValueError("User and item data not of the same shape")
 
-    opt_init, opt_update, get_params = optimizers.adam(step_size)
+    opt_init, opt_update, get_params = optimizers.sgd(step_size)
 
     num_batches = int(item_data.shape[0]/batch_size)
-    # take two matrices as argument instead?
     batches = data_stream(user_data, item_data,
                           num_batches, batch_size)
     itercount = itertools.count()
-    opt_state = opt_init(initial_params(np.max(user_data) + 1,
-                                        np.max(item_data) + 1,
+    opt_state = opt_init(initial_params(n_users,
+                                        n_items,
                                         z))
 
     def update(i, opt_state, batch):
         params = get_params(opt_state)
         user_data, item_data = batch
+        grad_loss = grad(loss)(params, z, max_samples, item_dataset,
+                               user_data, item_data)
         return opt_update(i,
-                          grad(loss)(params, item_dataset,
-                                     user_data, item_data),
+                          grad_loss,
                           opt_state)
 
     for epoch in range(num_epochs):
         print(f"Epoch {epoch}")
-#        start_time = time.time()
         for _ in tqdm(range(num_batches)):
             opt_state = update(next(itercount), opt_state, next(batches))
     params = get_params(opt_state)
