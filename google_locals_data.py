@@ -6,7 +6,7 @@ import pandas as pd
 import ast
 from tqdm import tqdm
 
-
+# Downloaded from http://cseweb.ucsd.edu/~jmcauley/datasets.html#google_local
 places_file = "data/places.clean.json"
 reviews_file = "data/reviews.clean.json"
 users_file = "data/users.clean.json"

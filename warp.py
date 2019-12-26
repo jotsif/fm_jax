@@ -38,7 +38,7 @@ def calc_score(user_repr, item_repr, z):
 
 
 def get_negative_item(params, user_repr, score_pos,
-                      item_dataset, max_samples, z, key):
+                      item_dataset, interactions, max_samples, z, key):
     """Sample a negative item ranked higher than the positive item"""
     n_items = item_dataset.shape[0]
 
@@ -68,6 +68,7 @@ def warp(params,
          z,
          max_samples,
          item_dataset,
+         interactions,
          user_data,
          item_data,
          key):
@@ -88,6 +89,7 @@ def warp(params,
                                           lax.stop_gradient(user_repr),
                                           lax.stop_gradient(score_pos),
                                           item_dataset,
+                                          interactions,
                                           max_samples,
                                           z,
                                           key)
@@ -131,13 +133,13 @@ def initial_params(n_user_features, n_item_features, z):
     ]
 
 
-def loss(params, z, max_samples, item_dataset,
+def loss(params, z, max_samples, item_dataset, interactions,
          user_data, item_data, key):
     """Convenience function for loss"""
     batch_size = user_data.shape[0]
     keys = random.split(key, batch_size)
-    res = vmap(warp, in_axes=(None, None, None, None, 0, 0, 0))(
-        params, z, max_samples, item_dataset,
+    res = vmap(warp, in_axes=(None, None, None, None, None, 0, 0, 0))(
+        params, z, max_samples, item_dataset, interactions,
         user_data, item_data, keys)
     return np.mean(res)
 
@@ -173,15 +175,15 @@ def prepare_data(interactions, user_feature_cols, item_feature_cols):
 def fit(user_data, item_data, item_dataset,
         num_epochs=1, step_size=0.1, batch_size=100, z=50,
         max_samples=10, seed=0):
+    """
+    user_feature is a list of column names for the user features
+    item_feature is a list of column names for the item features
+    """
     n_users = user_data.max() + 1
     n_items = item_data.max() + 1
     user_data = np.array(user_data)
     item_data = np.array(item_data)
     item_dataset = np.array(item_dataset)
-    """
-    user_feature is a list of column names for the user features
-    item_feature is a list of column names for the item features
-    """
     if user_data.shape[0] != item_data.shape[0]:
         raise ValueError("User and item data not of the same shape")
 
@@ -195,14 +197,15 @@ def fit(user_data, item_data, item_dataset,
                                         n_items,
                                         z))
     key = random.PRNGKey(seed)
+    interactions = 0
 
     @jit
     def update(i, opt_state, batch, key):
         params = get_params(opt_state)
         user_data, item_data = batch
         grad_loss = grad(loss)(params, z, max_samples,
-                               item_dataset, user_data,
-                               item_data, key)
+                               item_dataset, interactions,
+                               user_data, item_data, key)
         return opt_update(i,
                           grad_loss,
                           opt_state)
@@ -215,3 +218,45 @@ def fit(user_data, item_data, item_dataset,
                                next(batches), key_)
     params = get_params(opt_state)
     return params
+
+
+@jit
+def calc_auc(users, predictions, interactions):
+    """
+    Calculate the AUC for all users given their predictions
+    and item interactions.
+    """
+    n_items = predictions.shape[1]
+
+    def per_user(preds, interacts):
+        n_pos = interacts.sum()
+        pos = np.flip(np.argsort(preds))
+        ranks = interacts[pos].nonzero()[0]
+        r1 = ranks.sum()
+        u1 = r1 - n_pos * (n_pos + 1)/2
+        return u1/(n_pos * (n_items - n_pos))
+    return vmap(per_user)(users, predictions)
+
+
+@jit
+def predict(params, users, items):
+    z = params[USER_FEATURE_EMBEDDING_IDX].shape[1]
+    users = np.array(users)
+    items = np.array(items)
+
+    def score_user(params, user):
+        user_repr = compute_representation(
+            np.array([user]),  # should not have to do this
+            params[USER_FEATURE_EMBEDDING_IDX],
+            params[USER_BIAS_IDX])
+
+        def score_item(item):
+            item_repr = compute_representation(
+                item,
+                params[ITEM_FEATURE_EMBEDDING_IDX],
+                params[ITEM_BIAS_IDX])
+            score = calc_score(user_repr, item_repr, z)
+            return score
+        return vmap(score_item)(items)
+    score = vmap(score_user, in_axes=(None, 0))(params, users)
+    return score
