@@ -45,9 +45,10 @@ def get_negative_item(params, user_repr, score_pos,
     def resample(state):
         _, _, sampled, key = state
         sampled = sampled + 1
-        key, key_ = random.split(key)
-        neg_item = random.randint(key_, (1, ), 0, n_items)
+        #key, key_ = random.split(key)
+        #neg_item = random.randint(key_, (1, ), 0, n_items)
         # TODO: should not sample positive item
+        neg_item = npr.randint(0, n_items)
         neg_repr = compute_representation(item_dataset[neg_item],
                                           params[ITEM_FEATURE_EMBEDDING_IDX],
                                           params[ITEM_BIAS_IDX])
@@ -58,7 +59,7 @@ def get_negative_item(params, user_repr, score_pos,
         return (score_neg < score_pos - 1) & (sampled < max_samples)
 
     (neg_item, _, sampled, _) = lax.while_loop(cond, resample,
-                                               (np.array([0]), score_pos - 2,
+                                               (0, score_pos - 2,
                                                 0, key))
     return neg_item, sampled
 
